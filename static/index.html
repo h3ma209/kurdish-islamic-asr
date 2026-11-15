@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr" data-astryx-theme="neutral" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>تەفسیری قورئانی پیرۆز بە کوردی | Kurdish Quran Tafsir & Study</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Amiri+Quran&family=Amiri:wght@400;700&family=Figtree:wght@400;500;600;700&family=Noto+Kufi+Arabic:wght@400;600;700&family=Noto+Naskh+Arabic:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/node_modules/@astryxdesign/core/src/reset.css" />
+  <link rel="stylesheet" href="/node_modules/@astryxdesign/core/dist/astryx.css" />
+  <link rel="stylesheet" href="/node_modules/@astryxdesign/theme-neutral/fonts.css" />
+  <link rel="stylesheet" href="/node_modules/@astryxdesign/theme-neutral/dist/theme.css" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-layout">
+    <!-- PANE 1: Left Navigation (SideNav: 260px) -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">
+          <span class="brand-icon">
+            <svg class="ui-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/><path d="M6 2v20"/><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/></svg>
+          </span>
+          <div class="brand-text">
+            <h1>قورئان بە کوردی</h1>
+            <p>Kurdish Quran Tafsir</p>
+          </div>
+        </div>
+        <div class="filter-tabs">
+          <button class="tab-btn active" data-filter="juz_amma">Juz Amma</button>
+          <button class="tab-btn" data-filter="ready">Ready Audio</button>
+          <button class="tab-btn" data-filter="all">All 114</button>
+        </div>
+        <div class="search-box">
+          <input type="text" id="surah-search" placeholder="Search Surah (1, Ikhlas, الفاتحة)..." />
+        </div>
+      </div>
+      <div class="surah-list" id="surah-list">
+        <div class="loading-state">Loading Surahs...</div>
+      </div>
+    </aside>
+
+    <!-- PANE 2: Center Reading Workspace (Flex 1, focused study reader) -->
+    <main class="reading-pane">
+      <header class="surah-header-bar">
+        <div class="surah-info-group">
+          <span class="surah-badge" id="active-surah-num">Surah 1</span>
+          <h2 id="active-surah-title">Al-Faatiha — سُورَةُ ٱلْفَاتِحَةِ</h2>
+          <p id="active-surah-meta">7 Verses • Meccan • Whisper Subtitled</p>
+        </div>
+        <div class="header-actions">
+          <a id="yt-source-link" href="#" target="_blank" rel="noopener" class="btn btn-outline" title="Open YouTube Source">
+            <svg class="ui-icon" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.5 12 3.5 12 3.5s-7.505 0-9.377.55a3.016 3.016 0 0 0-2.122 2.136C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.55 9.376.55 9.376.55s7.505 0 9.377-.55a3.016 3.016 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
+            <span>YouTube</span>
+          </a>
+          <a id="download-vtt-link" href="#" download class="btn btn-outline" title="Download .VTT Subtitles">
+            <svg class="ui-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span>VTT</span>
+          </a>
+          <a id="download-srt-link" href="#" download class="btn btn-outline" title="Download .SRT Subtitles">
+            <svg class="ui-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span>SRT</span>
+          </a>
+        </div>
+      </header>
+
+      <!-- Unprocessed Notice Banner -->
+      <div class="process-banner hidden" id="process-banner">
+        <div class="process-banner-content">
+          <span class="process-icon">
+            <svg class="ui-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          </span>
+          <div>
+            <h3 id="process-banner-title">Audio & Subtitles Not Yet Extracted</h3>
+            <p id="process-banner-desc">Download recitation audio and run local Whisper alignment.</p>
+          </div>
+        </div>
+        <button id="btn-trigger-process" class="btn btn-primary">
+          <svg class="ui-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          <span>Extract Audio & Subtitles</span>
+        </button>
+      </div>
+
+      <!-- Quran Verses Stream -->
+      <section class="verses-section" id="verses-container">
+        <!-- Populated by app.js -->
+      </section>
+    </main>
+
+    <!-- PANE 3: Right Media & Studio Inspector (380px fixed width) -->
+    <aside class="media-inspector" id="media-inspector">
+      <!-- Fixed Audio Monitor Deck -->
+      <div class="inspector-monitor">
+        <div class="audio-monitor-deck" id="audio-wrapper">
+          <div class="audio-deck-meta">
+            <div class="audio-deck-status-row">
+              <span class="audio-live-pill" id="playback-status-pill">Audio Ready</span>
+              <span class="audio-surah-tag" id="playback-surah-pill">Surah 1</span>
+            </div>
+            <div class="audio-deck-title" id="playback-mode-badge">Idle • Select Ayah to Listen</div>
+          </div>
+          <audio id="main-video" controls preload="metadata" class="audio-player-element"></audio>
+        </div>
+
+        <!-- Real-time Live Subtitle Caption Box -->
+        <div class="live-subtitle-box" id="live-subtitle-box">
+          <div class="live-subtitle-meta">
+            <span class="cue-role-pill" id="live-cue-role">Whisper Subtitle</span>
+          </div>
+          <p class="live-cue-text" id="live-cue-text" dir="rtl">کلیک لەسەر ئایەتێک بکە بۆ بیستنی تەفسیری کوردی...</p>
+        </div>
+      </div>
+
+      <!-- Inspector Mode Tabs -->
+      <div class="inspector-nav">
+        <button class="inspector-tab-btn active" data-tab="playback">
+          <svg class="ui-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+          <span>Playback & Tafsir</span>
+        </button>
+        <button class="inspector-tab-btn" data-tab="studio">
+          <svg class="ui-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+          <span>Voice Studio</span>
+        </button>
+      </div>
+
+      <!-- Tab Content Area (Scrollable) -->
+      <div class="inspector-tab-content">
+        <!-- TAB 1: Playback Controls & Tafsir -->
+        <div class="inspector-pane" id="pane-playback">
+          <div class="playback-actions">
+            <button id="btn-play-all-tafsir" class="btn btn-primary btn-block">
+              <svg class="ui-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+              <span>Play All Kurdish Tafsir</span>
+            </button>
+            <div class="playback-row">
+              <button id="btn-play-full-surah" class="btn btn-secondary flex-1">
+                <svg class="ui-icon" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+                <span>Full Surah</span>
+              </button>
+              <button id="btn-stop-playback" class="btn btn-ghost">
+                <svg class="ui-icon" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+                <span>Stop</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Kurdish Tafsir Edition Selector -->
+          <div class="tafsir-selector-block">
+            <div class="tafsir-label-row">
+              <span class="tafsir-label-text">تەفسیری کوردی</span>
+              <span class="tafsir-active-pill" id="tafsir-active-pill">
+                <svg class="ui-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/><path d="M6 2v20"/><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/></svg>
+                <span class="tafsir-pill-text">تەفسیری ئاسان</span>
+              </span>
+            </div>
+            <select id="select-tafsir-edition" class="tafsir-dropdown">
+              <optgroup label="تەفسیری کوردی — سۆرانی (Kurdish Sorani)">
+                <option value="asan" selected>تەفسیری ئاسان — بورهان موحەممەد ئەمین</option>
+                <option value="raman">تەفسیری ڕامان — مەلا ئەحمەد کاکە مەحموود</option>
+                <option value="puxta">تەفسیری پوختە — مەلا عوسمان عەبدولعەزیز</option>
+                <option value="rebar">تەفسیری ڕێبەر — لەگەڵ فەرموودە و فەزڵەکان</option>
+                <option value="hazhar">وەرگێڕانی هەژار — هەژار موکریانی</option>
+                <option value="tawhid">تەفسیری تەوحید — دەستەی زانایان</option>
+                <option value="roshn">تەفسیری ڕۆشن — لە تەفسیری قورئان</option>
+              </optgroup>
+              <optgroup label="تەفسیری ناسراوی ئیسلامی بە کوردی (Classical in Kurdish)">
+                <option value="maisar">تەفسیری مویەسەر — التفسير الميسر (مەلیک فەهد)</option>
+                <option value="mokhtasar">تەفسیری موختەسەر — المختصر في التفسير</option>
+              </optgroup>
+              <optgroup label="تەفسیری کوردی — بادینی (Kurdish Badini)">
+                <option value="sanahi">تەفسیری ساناهی — ب شێوەزارێ بەهدینی</option>
+                <option value="zhin">تەفسیری ژین — ب شێوەزارێ بەهدینی</option>
+                <option value="runahi">تەفسیری ڕووناهی — ب شێوەزارێ بەهدینی</option>
+              </optgroup>
+              <optgroup label="تەفسیری سەرەکی ئیسلامی — عەرەبی (Classical Arabic)">
+                <option value="ibn_kathir">تفسير ابن كثير — الإمام الحافظ ابن كثير</option>
+                <option value="tabari">تفسير الطبري — الإمام ابن جرير الطبري</option>
+                <option value="qurtubi">تفسير القرطبي — الإمام أبو عبد الله القرطبي</option>
+                <option value="saadi">تفسير السعدي — الشيخ عبد الرحمن السعدي</option>
+              </optgroup>
+            </select>
+          </div>
+
+          <!-- Reading Settings Card -->
+          <div class="toggles-card">
+            <div class="card-section-label">Reading & Audio Settings</div>
+            <div class="toggles-stack">
+              <label class="astryx-switch-field" title="When the reciter groups 2-3 short verses together, play the full Kurdish tafsir block (default) or only the estimated sub-slice">
+                <span class="astryx-switch">
+                  <input type="checkbox" id="toggle-precise-slice" />
+                  <span class="astryx-switch-track">
+                    <span class="astryx-switch-thumb"></span>
+                  </span>
+                </span>
+                <span class="astryx-switch-label">Split Grouped Verses</span>
+              </label>
+
+              <label class="astryx-switch-field" title="Automatically advance to next verse's Kurdish tafsir after finishing">
+                <span class="astryx-switch">
+                  <input type="checkbox" id="toggle-auto-next" />
+                  <span class="astryx-switch-track">
+                    <span class="astryx-switch-thumb"></span>
+                  </span>
+                </span>
+                <span class="astryx-switch-label">Auto-Next Verse</span>
+              </label>
+
+              <label class="astryx-switch-field" title="Toggle Whisper raw transcript cards on verses">
+                <span class="astryx-switch">
+                  <input type="checkbox" id="toggle-show-whisper" checked />
+                  <span class="astryx-switch-track">
+                    <span class="astryx-switch-thumb"></span>
+                  </span>
+                </span>
+                <span class="astryx-switch-label">Show Whisper Transcript</span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 2: Kurdish Voice Studio -->
+        <div class="inspector-pane hidden" id="pane-studio">
+          <div class="cloner-studio" id="cloner-studio">
+            <div class="cloner-header">
+              <div>
+                <span class="cloner-badge">Sorani TTS & OpenVoice</span>
+                <h3>Narrator Voice Cloning</h3>
+              </div>
+              <div class="cloner-ref-box">
+                <span class="ref-label">Ref Voice:</span>
+                <audio id="ref-voice-audio" controls preload="none" src="/media/voice_refs/kurdish_narrator_ref_12s.wav"></audio>
+              </div>
+            </div>
+            <div class="cloner-body">
+              <textarea id="cloner-input-text" dir="rtl" rows="4" placeholder="دەقی کوردی لێرە بنووسە...">بەڕاستی ئێمە خێر و چاکەیەکی زۆر و بێ سنوورمان بە تۆ بەخشیوە ئەی پێغەمبەر.</textarea>
+              <div class="cloner-controls-stack">
+                <select id="cloner-engine-select" class="cloner-select">
+                  <option value="audio8_finetuned" selected>Audio8 Sorani Fine-Tuned (High Purity)</option>
+                  <option value="mms_openvoice">Native Sorani + OpenVoice V2</option>
+                  <option value="mms_native">MMS-TTS-CKB Native</option>
+                </select>
+                <div class="cloner-actions-row">
+                  <button id="btn-synthesize-custom" class="btn btn-clone-primary flex-1">
+                    <svg class="ui-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+                    <span>Generate Speech</span>
+                  </button>
+                  <button id="btn-stop-generation" class="btn btn-secondary" title="Cancel or Stop Speech Generation">
+                    <svg class="ui-icon" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+                    <span>Stop</span>
+                  </button>
+                </div>
+              </div>
+              <span id="cloner-status-text" class="cloner-status">Ready • Select Clone Voice on any verse or synthesize here.</span>
+              <audio id="cloner-output-audio" controls class="hidden"></audio>
+              <div id="cloner-phonetic-preview" class="cloner-phonetic hidden"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
