@@ -492,7 +492,10 @@ class ScriptureRescorer:
 
         kurdish_chars_re = re.compile(r"[ێۆڕڵگپچژڤ]")
         kurdish_suffix_re = re.compile(r"(ەکە|ەکان|ەوە|ێک|ەتی|یش)$")
-        kurdish_stops_strict = KURDISH_BOUNDARY_STOPWORDS - {"و", "یا", "مەن"}
+        kurdish_stops_strict = (KURDISH_BOUNDARY_STOPWORDS - {"و", "یا", "مەن"}) | {
+            "هەم", "هەر", "بێ", "تیا", "تیایە", "پێشوو", "دواتر", "سەیری", "چاکتر", "فراوانتر", "بەسوودتر",
+        }
+        phonetic_arabic_with_e = frozenset({"هەزە", "قەد", "فەقەد", "فەقال", "عەن", "مەن", "ئەن", "لەم"})
         arabic_anchors = frozenset({
             "ما", "عن", "من", "في", "فيهم", "على", "عليهم", "الي", "إلى",
             "هذا", "هذه", "هزه", "ذلك", "ذلک", "التي", "الذي", "الذين",
@@ -529,6 +532,7 @@ class ScriptureRescorer:
                 kurdish_chars_re.search(bare)
                 or bare in kurdish_stops_strict
                 or kurdish_suffix_re.search(bare)
+                or ("ە" in bare[:-1] and bare not in phonetic_arabic_with_e)
             ):
                 is_kurdish[idx] = True
                 continue
