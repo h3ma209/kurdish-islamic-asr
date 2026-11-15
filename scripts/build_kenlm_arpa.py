@@ -6,6 +6,8 @@ Build high-precision ARPA 3-gram Language Model for Kurdish Sorani + Classical A
 from __future__ import annotations
 
 import collections
+import glob
+import json
 import math
 import re
 import sqlite3
@@ -17,48 +19,58 @@ sys.path.insert(0, str(BASE_DIR))
 
 import kenlm
 
-STRIP_RE = re.compile(r"[\u064B-\u065F\u0670\u06D6-\u06ED\u0640\uf072﴿﴾«»]")
-ARABIC_TO_CKB_PHONETIC = str.maketrans({
-    "ص": "س",
-    "ض": "ز",
-    "ط": "ت",
-    "ظ": "ز",
-    "ذ": "ز",
-    "أ": "ا",
-    "إ": "ا",
-    "آ": "ا",
-    "ٱ": "ا",
-    "ة": "ە",
-    "ي": "ی",
-    "ك": "ک",
-    "ى": "ی",
-})
+STRIP_RE = re.compile(r"[\u064B-\u065F\u0670\u06D6-\u06ED\u0640\uf072\ufeff\u200C-\u200F﴿﴾«»ﷺ]")
+EXTRA_ARABIC_TOKENS = ("ذ", "ض", "ظ", "ص", "ط", "ة", "أ", "إ", "آ")
+
+
+def _load_allowed_chars() -> set[str]:
+    vocab_path = BASE_DIR / "data" / "models" / "mms_1b_islamic_kurdish" / "vocab.json"
+    chars = set(EXTRA_ARABIC_TOKENS)
+    if vocab_path.exists():
+        v = json.loads(vocab_path.read_text(encoding="utf-8"))
+        for k in v:
+            if len(k) == 1 and k != "|":
+                chars.add(k)
+    return chars
+
+
+ALLOWED_CHARS = _load_allowed_chars()
 
 
 def clean_sentence(text: str) -> list[str]:
-    # Strip harakat/marks and map Arabic-only letters to MMS ckb phonetic alphabet
-    cleaned = STRIP_RE.sub("", text).translate(ARABIC_TO_CKB_PHONETIC)
-    cleaned = re.sub(r"[«»\"()\[\]{},،؛;؟?!—–.:\-_/\\<>#*~`]", " ", cleaned)
-    words = [w.strip() for w in cleaned.split() if len(w.strip()) > 0]
+    """Preserves both Kurdish Sorani and Classical Arabic orthography; strips Harakat/punctuation."""
+    cleaned = re.sub(r"\[\[.*?\]\]|<[^>]+>", " ", text)
+    cleaned = STRIP_RE.sub("", cleaned).replace("ٱ", "ا")
+    cleaned = re.sub(r"[«»\"()\[\]{},،؛;؟?!—–.:\-_/\\<>#*~`…\d٠-٩]+", " ", cleaned)
+    words = []
+    for w in cleaned.split():
+        w = w.strip()
+        if w and all(ch in ALLOWED_CHARS for ch in w):
+            words.append(w)
     return words
+
 
 def collect_corpus() -> list[list[str]]:
     corpus = []
-    
-    # 1. Dataset sentences (weighted x3 for preacher vocabulary)
-    jsonl_path = BASE_DIR / "data" / "dataset" / "dataset.jsonl"
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                import json
-                obj = json.loads(line)
-                words = clean_sentence(obj["text"])
-                if words:
-                    for _ in range(3):
-                        corpus.append(words)
 
-    # 2. All 6,236 Quran Ayahs with Harakat
+    # 1. Lecture & Quran datasets (weighted x3 for preacher + recitation vocabulary)
+    for jname in ("dataset.jsonl", "quran_arabic.jsonl"):
+        jpath = BASE_DIR / "data" / "dataset" / jname
+        if not jpath.exists():
+            continue
+        with open(jpath, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    obj = json.loads(line)
+                    words = clean_sentence(obj["text"])
+                    if words:
+                        for _ in range(3):
+                            corpus.append(words)
+
+    # 2. All 6,236 Quran Ayahs + Hadiths + Dhikr
     db_path = BASE_DIR / "data" / "quran" / "kurdish_tafsirs.db"
+    if not db_path.exists():
+        db_path = BASE_DIR / "data" / "quran" / "scriptures.db"
     if db_path.exists():
         conn = sqlite3.connect(str(db_path))
         c = conn.cursor()
@@ -66,27 +78,32 @@ def collect_corpus() -> list[list[str]]:
             words = clean_sentence(row[0])
             if words:
                 corpus.append(words)
-        # Hadiths (Arabic & Kurdish translation)
-        for row in c.execute("SELECT ar_desc, ku_desc FROM farmuda"):
+        for row in c.execute("SELECT ar_desc FROM farmuda"):
             if row[0]:
                 words = clean_sentence(row[0])
                 if words:
                     corpus.append(words)
-            if row[1]:
-                words = clean_sentence(row[1])
-                if words:
-                    corpus.append(words)
-        # Dhikr
-        for row in c.execute("SELECT ardhikr, krdhikr FROM dhikr"):
+        for row in c.execute("SELECT ardhikr FROM dhikr"):
             if row[0]:
                 words = clean_sentence(row[0])
-                if words:
-                    corpus.append(words)
-            if row[1]:
-                words = clean_sentence(row[1])
                 if words:
                     corpus.append(words)
         conn.close()
+
+    # 3. Classical Arabic Tafsirs (Ibn Kathir, Qurtubi, Tabari) for Arabic n-gram priors
+    for tf in sorted(glob.glob(str(BASE_DIR / "data" / "quran" / "classical_tafsirs" / "*.json"))):
+        try:
+            data = json.loads(Path(tf).read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        texts = data.values() if isinstance(data, dict) else data
+        for raw in texts:
+            if not isinstance(raw, str):
+                continue
+            for seg in re.split(r"[.!؟\n]+", raw):
+                words = clean_sentence(seg)
+                if len(words) >= 3:
+                    corpus.append(words)
 
     return corpus
 

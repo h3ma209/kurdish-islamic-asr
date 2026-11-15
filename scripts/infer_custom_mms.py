@@ -19,6 +19,7 @@ sys.path.insert(0, str(BASE_DIR))
 import numpy as np
 import soundfile as sf
 import torch
+import torch.nn as nn
 import torchaudio.functional as AF
 from pyctcdecode import build_ctcdecoder
 from transformers import AutoProcessor, Wav2Vec2ForCTC
@@ -29,6 +30,7 @@ MODEL_DIR = BASE_DIR / "data" / "models" / "mms_1b_islamic_kurdish"
 ARPA_PATH = MODEL_DIR / "kurdish_islamic_3gram.arpa"
 HEAD_PATH = MODEL_DIR / "finetuned_ckb_head.pt"
 ADAPTER_PATH = MODEL_DIR / "finetuned_ckb_adapter.pt"
+VOCAB_PATH = MODEL_DIR / "vocab.json"
 
 
 class IslamicKurdishTranscriber:
@@ -41,12 +43,20 @@ class IslamicKurdishTranscriber:
         self.model = Wav2Vec2ForCTC.from_pretrained("facebook/mms-1b-all")
         self.processor.tokenizer.set_target_lang("ckb")
         self.model.load_adapter("ckb")
+        vocab = json.loads(VOCAB_PATH.read_text(encoding="utf-8")) if VOCAB_PATH.exists() else self.processor.tokenizer.get_vocab()
         if ADAPTER_PATH.exists():
             ckpt = torch.load(ADAPTER_PATH, map_location="cpu")
             for idx, state in ckpt["adapters"].items():
                 self.model.wav2vec2.encoder.layers[int(idx)].adapter_layer.load_state_dict(state)
+            head_out = ckpt["lm_head"]["weight"].shape[0]
+            if head_out != self.model.lm_head.out_features:
+                self.model.lm_head = nn.Linear(
+                    self.model.lm_head.in_features,
+                    head_out,
+                    bias=self.model.lm_head.bias is not None,
+                )
             self.model.lm_head.load_state_dict(ckpt["lm_head"])
-            print(f"Loaded fine-tuned ckb adapters ({ckpt['start_layer']}..47) + lm_head from {ADAPTER_PATH.name}!")
+            print(f"Loaded fine-tuned bilingual adapters ({ckpt['start_layer']}..47) + {head_out}-tok lm_head from {ADAPTER_PATH.name}!")
         elif HEAD_PATH.exists():
             self.model.lm_head.load_state_dict(torch.load(HEAD_PATH, map_location="cpu"))
             print(f"Loaded fine-tuned ckb lm_head from {HEAD_PATH.name}!")
@@ -56,8 +66,8 @@ class IslamicKurdishTranscriber:
         print(f"Model loaded in {time.time() - t0:.2f}s!")
 
         # Initialize PyCTCDecode + KenLM
-        vocab = self.processor.tokenizer.get_vocab()
         inv_vocab = {v: k for k, v in vocab.items()}
+        self.inv_vocab = inv_vocab
         labels = []
         for i in range(len(vocab)):
             tok = inv_vocab.get(i, "")
@@ -128,7 +138,17 @@ class IslamicKurdishTranscriber:
             # If KenLM glued multiple OOV tokens into a long string, restore acoustic spaces from greedy CTC
             if len(word) > 12:
                 span_ids = np.argmax(logits_np[max(0, st - 1):min(len(logits_np), en + 1)], axis=-1)
-                greedy_span = self.processor.decode(span_ids).strip()
+                # Decode greedy CTC tokens using expanded 120-token inv_vocab
+                prev = -1
+                chars = []
+                for tid in span_ids:
+                    if tid != prev:
+                        if tid != 0 and tid in self.inv_vocab:
+                            tok = self.inv_vocab[tid]
+                            if tok not in ("<s>", "</s>", "<unk>", "<pad>"):
+                                chars.append(" " if tok == "|" else tok)
+                        prev = tid
+                greedy_span = "".join(chars).strip()
                 words_out.append(greedy_span if " " in greedy_span else word)
             else:
                 words_out.append(word)

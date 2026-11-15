@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -26,26 +27,23 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATASET_DIR = BASE_DIR / "data" / "dataset"
 OUTPUT_DIR = BASE_DIR / "data" / "models" / "mms_1b_islamic_kurdish"
 
-STRIP_RE = re.compile(r"[\u064B-\u065F\u0670\u06D6-\u06ED﴿﴾«»]")
-ARABIC_TO_CKB_PHONETIC = str.maketrans({
-    "ص": "س",
-    "ض": "ز",
-    "ط": "ت",
-    "ظ": "ز",
+STRIP_RE = re.compile(r"[\u064B-\u065F\u0670\u06D6-\u06ED\u0640\uf072\ufeff\u200C-\u200F﴿﴾«»ﷺ]")
+EXTRA_ARABIC_TOKENS = ("ذ", "ض", "ظ", "ص", "ط", "ة", "أ", "إ", "آ")
+PHONETIC_TWIN_MAP = {
     "ذ": "ز",
+    "ض": "ز",
+    "ظ": "ز",
+    "ص": "س",
+    "ط": "ت",
+    "ة": "ه",
     "أ": "ا",
     "إ": "ا",
     "آ": "ا",
-    "ٱ": "ا",
-    "ة": "ە",
-    "ي": "ی",
-    "ك": "ک",
-    "ى": "ی",
-})
+}
 
 
-def encode_ckb_phonetic(text: str, vocab: dict[str, int]) -> list[int]:
-    clean = STRIP_RE.sub("", text).translate(ARABIC_TO_CKB_PHONETIC)
+def encode_bilingual(text: str, vocab: dict[str, int]) -> list[int]:
+    clean = STRIP_RE.sub("", text).replace("ٱ", "ا")
     clean = re.sub(r"\s+", " ", clean).strip()
     ids = []
     for ch in clean:
@@ -55,14 +53,78 @@ def encode_ckb_phonetic(text: str, vocab: dict[str, int]) -> list[int]:
     return ids
 
 
-def train_mms_ckb_head(epochs: int = 10, lr: float = 6e-5, accum_steps: int = 8, start_layer: int = 24):
+def expand_vocab_and_head(
+    base_vocab: dict[str, int],
+    model: Wav2Vec2ForCTC,
+    ckpt_path: Path,
+    backup_path: Path,
+) -> dict[str, int]:
+    vocab = dict(base_vocab)
+    next_id = max(vocab.values()) + 1
+    for tok in EXTRA_ARABIC_TOKENS:
+        if tok not in vocab:
+            vocab[tok] = next_id
+            next_id += 1
+
+    old_head = model.lm_head
+    in_dim = old_head.in_features
+    has_bias = old_head.bias is not None
+    new_head = nn.Linear(in_dim, len(vocab), bias=has_bias)
+
+    src_ckpt = backup_path if backup_path.exists() else (ckpt_path if ckpt_path.exists() else None)
+    if ckpt_path.exists() and not backup_path.exists():
+        tmp = torch.load(ckpt_path, map_location="cpu")
+        if tmp["lm_head"]["weight"].shape[0] == len(base_vocab):
+            shutil.copy2(ckpt_path, backup_path)
+            src_ckpt = backup_path
+            print(f"Backed up {len(base_vocab)}-token checkpoint -> {backup_path.name}")
+
+    with torch.no_grad():
+        if src_ckpt is not None:
+            ckpt = torch.load(src_ckpt, map_location="cpu")
+            for idx, state in ckpt["adapters"].items():
+                model.wav2vec2.encoder.layers[int(idx)].adapter_layer.load_state_dict(state)
+            w = ckpt["lm_head"]["weight"]
+            n_copy = min(w.shape[0], len(vocab))
+            new_head.weight[:n_copy].copy_(w[:n_copy])
+            if has_bias and "bias" in ckpt["lm_head"]:
+                b = ckpt["lm_head"]["bias"]
+                new_head.bias[:n_copy].copy_(b[:n_copy])
+            # Warm-start extra Arabic rows from phonetic twins if expanding from 111
+            if w.shape[0] < len(vocab):
+                for tok, twin in PHONETIC_TWIN_MAP.items():
+                    tid, wid = vocab[tok], vocab[twin]
+                    new_head.weight[tid].copy_(new_head.weight[wid])
+                    if has_bias:
+                        new_head.bias[tid].copy_(new_head.bias[wid])
+            print(f"Warm-started adapters + {n_copy}->{len(vocab)} lm_head rows from {src_ckpt.name}!")
+        else:
+            n_copy = old_head.weight.shape[0]
+            new_head.weight[:n_copy].copy_(old_head.weight)
+            if has_bias:
+                new_head.bias[:n_copy].copy_(old_head.bias)
+            for tok, twin in PHONETIC_TWIN_MAP.items():
+                tid, wid = vocab[tok], vocab[twin]
+                new_head.weight[tid].copy_(new_head.weight[wid])
+                if has_bias:
+                    new_head.bias[tid].copy_(new_head.bias[wid])
+
+    model.lm_head = new_head
+    return vocab
+
+
+def train_mms_ckb_head(epochs: int = 8, lr: float = 5e-5, accum_steps: int = 8, start_layer: int = 24):
     device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Fine-Tuning Meta MMS-1B ckb top-{48 - start_layer} adapter layers + lm_head on {device}...")
+    print(f"Fine-Tuning Meta MMS-1B bilingual (ckb+ar) top-{48 - start_layer} adapter layers + 120-tok lm_head on {device}...")
 
     processor = AutoProcessor.from_pretrained("facebook/mms-1b-all")
     model = Wav2Vec2ForCTC.from_pretrained("facebook/mms-1b-all", attn_implementation="eager")
     processor.tokenizer.set_target_lang("ckb")
     model.load_adapter("ckb")
+
+    ckpt_path = OUTPUT_DIR / "finetuned_ckb_adapter.pt"
+    backup_path = OUTPUT_DIR / "finetuned_ckb_adapter_111.pt.bak"
+    vocab = expand_vocab_and_head(processor.tokenizer.get_vocab(), model, ckpt_path, backup_path)
     model.to(device)
 
     for p in model.parameters():
@@ -78,25 +140,31 @@ def train_mms_ckb_head(epochs: int = 10, lr: float = 6e-5, accum_steps: int = 8,
         p.requires_grad = True
         trainable_params.append(p)
 
-    vocab = processor.tokenizer.get_vocab()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_DIR / "vocab.json", "w", encoding="utf-8") as f:
         json.dump(vocab, f, ensure_ascii=False, indent=2)
 
     n_params = sum(p.numel() for p in trainable_params)
-    print(f"Frozen layers 0..{start_layer - 1} | Trainable ckb adapters ({start_layer}..47) + lm_head: {n_params:,} params\n")
+    print(f"Frozen layers 0..{start_layer - 1} | Trainable adapters ({start_layer}..47) + {len(vocab)}-tok lm_head: {n_params:,} params\n")
 
     samples = []
-    with open(DATASET_DIR / "dataset.jsonl", "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            item = json.loads(line)
-            wav_path = DATASET_DIR / item["audio_file"]
-            if wav_path.exists() and item["duration"] >= 0.8:
-                labels = encode_ckb_phonetic(item["text"], vocab)
-                if len(labels) > 0 and int(item["duration"] * 50) >= len(labels):
-                    samples.append({"wav_path": str(wav_path), "labels": labels})
+    for jname in ("dataset.jsonl", "quran_arabic.jsonl"):
+        jpath = DATASET_DIR / jname
+        if not jpath.exists():
+            continue
+        cnt = 0
+        with open(jpath, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                wav_path = DATASET_DIR / item["audio_file"]
+                if wav_path.exists() and item["duration"] >= 0.8:
+                    labels = encode_bilingual(item["text"], vocab)
+                    if len(labels) > 0 and int(item["duration"] * 50) >= len(labels):
+                        samples.append({"wav_path": str(wav_path), "labels": labels})
+                        cnt += 1
+        print(f" - Loaded {cnt} clips from {jname}")
 
     print(f"Loaded {len(samples)} clean verified clips for training.")
     np.random.seed(42)
@@ -231,6 +299,7 @@ def train_mms_ckb_head(epochs: int = 10, lr: float = 6e-5, accum_steps: int = 8,
             torch.save(
                 {
                     "start_layer": start_layer,
+                    "vocab_size": len(vocab),
                     "adapters": {start_layer + idx: layer.adapter_layer.state_dict() for idx, layer in enumerate(enc.layers)},
                     "lm_head": model.lm_head.state_dict(),
                 },
