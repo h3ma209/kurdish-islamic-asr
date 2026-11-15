@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -93,6 +93,7 @@ class ScriptureRescorer:
     def __init__(self, db_path: Path = DB_PATH):
         self.scriptures: list[dict] = []
         self.trigram_index: dict[str, list[int]] = defaultdict(list)
+        self.arabic_vocab: dict[str, str] = {}
         try:
             from rapidfuzz import fuzz
             self.fuzz = fuzz
@@ -102,6 +103,7 @@ class ScriptureRescorer:
             self.has_rapidfuzz = False
         self._load_scriptures(db_path)
         self._build_phonetic_index()
+        self._build_arabic_vocab(db_path)
 
     def _add_scripture(self, kind: str, ref: str, harakat_text: str, min_words: int = 2):
         t = harakat_text.strip().rstrip(":：")
@@ -428,11 +430,159 @@ class ScriptureRescorer:
             res = re.sub(pat, repl, res)
         return res
 
+    @staticmethod
+    def _arabic_lookup_key(w: str) -> str:
+        """Phonetic key preserving final ى vs ي and trailing ة/ه for Arabic word lookup."""
+        s = re.sub(r"[\u064B-\u065F\u0670\u06D6-\u06ED\u200C-\u200F.,،؛:!?؟﴿﴾«»\(\)\[\]\"'ـ]", "", w)
+        if not s:
+            return ""
+        s = re.sub(r"[أإآٱ]", "ا", s)
+        s = s.replace("ئ", "ي").replace("ؤ", "و").replace("ء", "")
+        s = s.replace("ک", "ك").replace("گ", "ك").replace("ی", "ي")
+        s = s.replace("ة", "ه")
+        if s.endswith("ە") and len(s) >= 3:
+            s = s[:-1] + "ه"
+        s = s.replace("ە", "")
+        s = s.replace("ذ", "ز").replace("ظ", "ز").replace("ض", "ز")
+        s = s.replace("ث", "س").replace("ص", "س").replace("ط", "ت")
+        s = re.sub(r"(.)\1+", r"\1", s)
+        return s
+
+    def _build_arabic_vocab(self, db_path: Path):
+        counts: Counter[str] = Counter()
+        extra_classical = [
+            "رأي", "رأسا", "الشيعة", "هذه", "هذا", "ذلك", "هؤلاء", "أولئك",
+            "إنما", "أنما", "لأن", "كأن", "أليس", "بلى", "حيث", "منذ", "أيضا",
+            "جدا", "مثلا", "أصلا", "معنى", "الحديث", "الصحيح", "الضعيف", "الإسناد",
+            "الصحابة", "التابعين", "الأئمة", "العلماء", "الفتوى", "العقيدة",
+            "الشريعة", "السنة", "البدعة", "الجماعة", "الأمة", "الإسلام", "الإيمان",
+            "التوحيد", "الشرك", "العبادة", "الأعجاز", "بأعجاز", "يتعلقون", "رأيتهم",
+        ]
+        for w in extra_classical:
+            counts[w] += 100
+
+        if db_path.exists():
+            conn = sqlite3.connect(str(db_path))
+            for tbl, col in [("ayah_text", "text"), ("farmuda", "ar_desc"), ("dhikr", "ardhikr")]:
+                try:
+                    for (t,) in conn.execute(f"SELECT {col} FROM {tbl}"):
+                        if not t:
+                            continue
+                        clean = re.sub(r"[\u064B-\u065F\u0670\u06D6-\u06ED\u200C-\u200F﴿﴾«»\[\].,،؛:!?؟]", "", t)
+                        for w in clean.split():
+                            if len(w) >= 2:
+                                counts[w] += 1
+                except sqlite3.OperationalError:
+                    pass
+            conn.close()
+
+        self.arabic_vocab.clear()
+        for w, _ in counts.most_common():
+            k = self._arabic_lookup_key(w)
+            if k and k not in self.arabic_vocab:
+                self.arabic_vocab[k] = w
+
+    def rescore_arabic_spans(self, text: str) -> str:
+        """Detects unquoted code-switched Arabic spans and restores Arabic script/hamzas/ta-marbuta."""
+        if not self.arabic_vocab:
+            return text
+        words = text.split()
+        if len(words) < 3:
+            return text
+
+        kurdish_chars_re = re.compile(r"[ێۆڕڵگپچژڤ]")
+        kurdish_suffix_re = re.compile(r"(ەکە|ەکان|ەوە|ێک|ەتی|یش)$")
+        kurdish_stops_strict = KURDISH_BOUNDARY_STOPWORDS - {"و", "یا", "مەن"}
+        arabic_anchors = frozenset({
+            "ما", "عن", "من", "في", "فيهم", "على", "عليهم", "الي", "إلى",
+            "هذا", "هذه", "هزه", "ذلك", "ذلک", "التي", "الذي", "الذين",
+            "ليس", "قال", "فقال", "كان", "کان", "كنت", "کنت", "وكانت", "وكنت", "وکنت",
+            "قد", "قەد", "وقد", "أن", "إن", "ان", "لم", "لن", "هو", "هي", "هم",
+            "لا", "إلا", "الا", "ولا", "وما", "فإن", "فإذا", "يا", "یا", "رسول",
+            "راي", "رأي", "رايتهم", "رأيتهم", "يتعلقون", "یتعلقون", "فيها",
+            "له", "لها", "لهم", "به", "بها", "بهم", "منه", "منها", "منهم",
+            "عنه", "عنها", "عنهم", "ابو", "أبو", "ابن", "بن", "اهل", "أهل",
+        })
+        honorific_tokens = frozenset({
+            "صَلَّى", "اللَّهُ", "عَلَيْهِ", "وَسَلَّمَ", "الصَّلَاةُ", "وَالسَّلَامُ",
+            "سُبْحَانَهُ", "وَتَعَالَى", "رَضِيَ", "عَنْهُ", "رَسُولُ", "اللَّهِ", "عَزَّ", "وَجَلَّ",
+        })
+
+        n = len(words)
+        in_quote = False
+        locked = [False] * n
+        is_kurdish = [False] * n
+        is_anchor = [False] * n
+
+        for idx, w in enumerate(words):
+            if "﴿" in w or "«" in w:
+                in_quote = True
+            if in_quote or w in honorific_tokens:
+                locked[idx] = True
+            if "﴾" in w or "»" in w:
+                in_quote = False
+            if locked[idx]:
+                continue
+
+            bare = re.sub(r"[.,،؛:!?؟]", "", w)
+            if (
+                kurdish_chars_re.search(bare)
+                or bare in kurdish_stops_strict
+                or kurdish_suffix_re.search(bare)
+            ):
+                is_kurdish[idx] = True
+                continue
+
+            norm_ar = bare.replace("ک", "ك").replace("ی", "ي")
+            if norm_ar in arabic_anchors or bare in arabic_anchors:
+                is_anchor[idx] = True
+
+        # Find maximal contiguous non-locked, non-Kurdish runs
+        i = 0
+        while i < n:
+            if locked[i] or is_kurdish[i]:
+                i += 1
+                continue
+            j = i
+            anchor_cnt = 0
+            while j < n and not locked[j] and not is_kurdish[j]:
+                if is_anchor[j]:
+                    anchor_cnt += 1
+                j += 1
+            span_len = j - i
+            if span_len >= 3 and anchor_cnt >= 2:
+                for pos in range(i, j):
+                    w = words[pos]
+                    m_punct = re.match(r"^([^\w\u0600-\u06FF]*)(.*?)([^\w\u0600-\u06FF]*)$", w)
+                    pre, core, post = m_punct.groups() if m_punct else ("", w, "")
+                    if not core:
+                        continue
+                    # Orthographic Kurdish -> Arabic
+                    norm = core.replace("ک", "ك").replace("ی", "ي")
+                    if norm.endswith("ە") and len(norm) >= 4:
+                        norm = norm[:-1] + "ة"
+
+                    key = self._arabic_lookup_key(core)
+                    if key in self.arabic_vocab:
+                        words[pos] = f"{pre}{self.arabic_vocab[key]}{post}"
+                    elif len(norm) >= 4 and norm[0] in ("و", "ف", "ب", "ل", "ك"):
+                        stem_key = self._arabic_lookup_key(norm[1:])
+                        if stem_key in self.arabic_vocab:
+                            words[pos] = f"{pre}{norm[0]}{self.arabic_vocab[stem_key]}{post}"
+                        else:
+                            words[pos] = f"{pre}{norm}{post}"
+                    else:
+                        words[pos] = f"{pre}{norm}{post}"
+            i = j
+
+        return " ".join(words)
+
     def rescore(self, text: str) -> str:
         text = self.rescore_spoken_quran_patterns(text)
         text = self.rescore_honorifics(text)
         text = self.rescore_lexicon(text)
         text = self.match_scriptures(text)
+        text = self.rescore_arabic_spans(text)
         text = self.rescore_lexicon(text)
         text = re.sub(r"\s+", " ", text).strip()
         return text
