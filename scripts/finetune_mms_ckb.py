@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import json
 import random
 import re
@@ -156,12 +157,15 @@ def _extract_hidden_states(
     start_layer: int,
     device: str,
     use_amp: bool,
+    shard_dir: Path,
+    split_name: str,
     max_batch_size: int = 16,
     max_batch_samples: int = 16000 * 80,
+    shard_size: int = 512,
     speed_perturb: bool = False,
     label_desc: str = "clips",
-) -> list[dict]:
-    """Extract layer-`start_layer` hidden states in duration-budgeted batches with AMP."""
+) -> tuple[list[str], int]:
+    """Stream layer-`start_layer` hidden states to disk shards with minimal CPU RAM."""
     enc = model.wav2vec2.encoder
     all_layers = enc.layers
     orig_ln = enc.layer_norm
@@ -169,31 +173,59 @@ def _extract_hidden_states(
     enc.layers = all_layers[:start_layer]
     enc.layer_norm = nn.Identity()
 
-    items: list[tuple[np.ndarray, list[int]]] = []
     speeds = (0.9, 1.0, 1.1) if speed_perturb else (1.0,)
+    meta: list[tuple[str, float, int, list[int]]] = []
     for s in samples:
-        wav_t = _load_wav_mono(s["wav_path"])
-        wav_dev = wav_t.unsqueeze(0).to(device) if (speed_perturb and device == "cuda") else wav_t.unsqueeze(0)
+        n_frames = sf.info(s["wav_path"]).frames
         for spd in speeds:
-            if spd == 1.0:
-                w_aug = wav_t.numpy()
-            else:
-                w_aug = AF.resample(wav_dev, int(16000 * spd), 16000).squeeze(0).cpu().numpy()
-            if int((len(w_aug) / 16000.0) * 50) <= len(s["labels"]):
+            est_len = int(n_frames / spd)
+            if int((est_len / 16000.0) * 50) <= len(s["labels"]):
                 continue
-            items.append((w_aug, s["labels"]))
+            meta.append((s["wav_path"], spd, est_len, s["labels"]))
 
-    # Sort longest-first so large allocations happen upfront without caching fragmentation
-    items.sort(key=lambda x: len(x[0]), reverse=True)
-    batches = _pack_batches_by_budget(items, lambda x: len(x[0]), max_batch_size, max_batch_samples)
-    cached: list[dict] = []
-    amp_ctx = torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else contextlib.nullcontext()
+    # Sort longest-first so large GPU allocations happen upfront without fragmentation
+    meta.sort(key=lambda x: x[2], reverse=True)
+    batches = _pack_batches_by_budget(meta, lambda x: x[2], max_batch_size, max_batch_samples)
+
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    shard_paths: list[str] = []
+    shard_buf: list[dict] = []
+    shard_idx = 0
+    total_saved = 0
     done = 0
     next_log = 640
+    amp_ctx = torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else contextlib.nullcontext()
+
+    def _flush_shard():
+        nonlocal shard_idx
+        if not shard_buf:
+            return
+        spath = shard_dir / f"{split_name}_{shard_idx:03d}.pt"
+        torch.save(shard_buf, spath)
+        shard_paths.append(str(spath))
+        shard_buf.clear()
+        shard_idx += 1
 
     with torch.no_grad():
         for batch in batches:
-            wavs = [b[0] for b in batch]
+            wavs: list[np.ndarray] = []
+            labels_list: list[list[int]] = []
+            for wav_path, spd, _, labels in batch:
+                wav_t = _load_wav_mono(wav_path)
+                if spd == 1.0:
+                    w_aug = wav_t.numpy()
+                else:
+                    wav_dev = wav_t.unsqueeze(0).to(device) if device == "cuda" else wav_t.unsqueeze(0)
+                    w_aug = AF.resample(wav_dev, int(16000 * spd), 16000).squeeze(0).cpu().numpy()
+                if int((len(w_aug) / 16000.0) * 50) <= len(labels):
+                    continue
+                wavs.append(w_aug)
+                labels_list.append(labels)
+
+            if not wavs:
+                done += len(batch)
+                continue
+
             inp = processor(wavs, sampling_rate=16000, return_tensors="pt", padding=True)
             input_values = inp.input_values.to(device)
             attention_mask = inp.attention_mask.to(device) if "attention_mask" in inp else None
@@ -209,19 +241,24 @@ def _extract_hidden_states(
 
             hidden_batch = out.last_hidden_state.half().cpu()
             for i, flen in enumerate(feat_lens):
-                cached.append({
+                shard_buf.append({
                     "hidden": hidden_batch[i, :int(flen)].contiguous(),
-                    "labels": torch.tensor(batch[i][1], dtype=torch.long),
+                    "labels": torch.tensor(labels_list[i], dtype=torch.long),
                 })
+                total_saved += 1
+
+            if len(shard_buf) >= shard_size:
+                _flush_shard()
 
             done += len(batch)
-            if done >= next_log or done == len(items):
-                print(f" - [{done}/{len(items)}] {label_desc} extracted...")
+            if done >= next_log or done == len(meta):
+                print(f" - [{done}/{len(meta)}] {label_desc} extracted...")
                 next_log += 640
 
+    _flush_shard()
     enc.layers = all_layers
     enc.layer_norm = orig_ln
-    return cached
+    return shard_paths, total_saved
 
 
 def _apply_spec_aug(h: torch.Tensor) -> torch.Tensor:
@@ -324,17 +361,23 @@ def train_mms_ckb_head(
     train_samples = [samples[i] for i in indices[:split]]
     val_samples = [samples[i] for i in indices[split:]]
 
-    feat_cache_path = OUTPUT_DIR / f"cached_features_L{start_layer}.pt"
-    cached_train, cached_val = None, None
-    if use_cache and feat_cache_path.exists():
-        cache_data = torch.load(feat_cache_path, map_location="cpu")
-        if cache_data.get("n_samples") == len(samples):
-            cached_train = cache_data["train"]
-            cached_val = cache_data["val"]
-            print(f"Loaded cached layer-{start_layer} features from {feat_cache_path.name} ({len(cached_train)} train, {len(cached_val)} val).")
+    shard_dir = OUTPUT_DIR / f"feature_shards_L{start_layer}"
+    manifest_path = shard_dir / "manifest.json"
+    train_shards, val_shards = None, None
+    n_train, n_val = 0, 0
+    if use_cache and manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("n_samples") == len(samples) and all(Path(p).exists() for p in manifest.get("train_shards", [])):
+            train_shards = manifest["train_shards"]
+            val_shards = manifest["val_shards"]
+            n_train = manifest["n_train"]
+            n_val = manifest["n_val"]
+            print(f"Loaded cached layer-{start_layer} shards from {shard_dir.name} ({n_train} train, {n_val} val).")
 
-    if cached_train is None:
-        print(f"Pre-extracting layer-{start_layer} hidden states for {len(samples)} clips (duration-budgeted, max bs=16)...")
+    if train_shards is None:
+        if shard_dir.exists():
+            shutil.rmtree(shard_dir)
+        print(f"Pre-extracting layer-{start_layer} hidden states for {len(samples)} clips (sharded, max bs=16)...")
         t_ext = time.time()
         model.wav2vec2.eval()
         # Offload unused top layers to CPU during extraction to save ~1.9 GB VRAM
@@ -342,22 +385,28 @@ def train_mms_ckb_head(
             for layer in enc.layers[start_layer:]:
                 layer.to("cpu")
             torch.cuda.empty_cache()
-        cached_train = _extract_hidden_states(
+        train_shards, n_train = _extract_hidden_states(
             train_samples, processor, model, start_layer, device, use_amp,
+            shard_dir=shard_dir, split_name="train",
             max_batch_size=16, max_batch_samples=16000 * 80, speed_perturb=True, label_desc="train samples (3x speed perturb)",
         )
-        cached_val = _extract_hidden_states(
+        val_shards, n_val = _extract_hidden_states(
             val_samples, processor, model, start_layer, device, use_amp,
+            shard_dir=shard_dir, split_name="val",
             max_batch_size=16, max_batch_samples=16000 * 80, speed_perturb=False, label_desc="val samples",
         )
         print(f"Extraction complete in {time.time() - t_ext:.2f}s!")
         if use_cache:
-            torch.save({"n_samples": len(samples), "train": cached_train, "val": cached_val}, feat_cache_path)
+            manifest_path.write_text(
+                json.dumps({"n_samples": len(samples), "train_shards": train_shards, "val_shards": val_shards, "n_train": n_train, "n_val": n_val}),
+                encoding="utf-8",
+            )
 
     print("Freeing lower backbone...")
     del model.wav2vec2.feature_extractor
     del model.wav2vec2.feature_projection
     enc.layers = enc.layers[start_layer:]
+    gc.collect()
     if device == "cuda":
         for layer in enc.layers:
             layer.to(device)
@@ -404,7 +453,6 @@ def train_mms_ckb_head(
         return criterion(log_probs, targets, input_lens, target_lens)
 
     t0 = time.time()
-    val_batches = _make_length_bucketed_batches(cached_val, batch_size=batch_size, shuffle=False)
 
     for epoch in range(1, epochs + 1):
         enc.layers.eval()
@@ -412,41 +460,52 @@ def train_mms_ckb_head(
             layer.adapter_layer.train()
         model.lm_head.train()
         train_loss = 0.0
-        train_batches = _make_length_bucketed_batches(cached_train, batch_size=batch_size, shuffle=True)
+        shard_order = list(train_shards)
+        random.shuffle(shard_order)
         optimizer.zero_grad(set_to_none=True)
 
-        for step, batch in enumerate(train_batches, 1):
-            loss = run_batch(batch, augment=True)
-            if not torch.isnan(loss) and not torch.isinf(loss):
-                scaler.scale(loss / accum_steps).backward()
-                train_loss += loss.item() * len(batch)
+        step = 0
+        for s_idx, spath in enumerate(shard_order):
+            shard_data = torch.load(spath, map_location="cpu")
+            train_batches = _make_length_bucketed_batches(shard_data, batch_size=batch_size, shuffle=True)
+            for b_idx, batch in enumerate(train_batches):
+                step += 1
+                loss = run_batch(batch, augment=True)
+                if not torch.isnan(loss) and not torch.isinf(loss):
+                    scaler.scale(loss / accum_steps).backward()
+                    train_loss += loss.item() * len(batch)
 
-            if step % accum_steps == 0 or step == len(train_batches):
-                if use_amp:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    has_nan = any(p.grad is not None and torch.isnan(p.grad).any() for p in trainable_params)
-                    if not has_nan:
+                is_last = (s_idx == len(shard_order) - 1) and (b_idx == len(train_batches) - 1)
+                if step % accum_steps == 0 or is_last:
+                    if use_amp:
+                        scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-                        optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        has_nan = any(p.grad is not None and torch.isnan(p.grad).any() for p in trainable_params)
+                        if not has_nan:
+                            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                            optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+            del shard_data
 
         scheduler.step()
-        train_loss /= len(cached_train)
+        train_loss /= max(n_train, 1)
 
         enc.layers.eval()
         model.lm_head.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for batch in val_batches:
-                loss = run_batch(batch, augment=False)
-                if not torch.isnan(loss) and not torch.isinf(loss):
-                    val_loss += loss.item() * len(batch)
+            for spath in val_shards:
+                shard_data = torch.load(spath, map_location="cpu")
+                for batch in _make_length_bucketed_batches(shard_data, batch_size=batch_size, shuffle=False):
+                    loss = run_batch(batch, augment=False)
+                    if not torch.isnan(loss) and not torch.isinf(loss):
+                        val_loss += loss.item() * len(batch)
+                del shard_data
 
-        val_loss /= len(cached_val)
+        val_loss /= max(n_val, 1)
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
