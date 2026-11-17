@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gc
+import inspect
 import json
 import random
 import re
@@ -31,6 +32,13 @@ try:
     from transformers.models.wav2vec2.modeling_wav2vec2 import create_bidirectional_mask
 except ImportError:
     create_bidirectional_mask = None
+
+_BIDIR_EMBED_KEY = (
+    "inputs_embeds"
+    if create_bidirectional_mask is not None
+    and "inputs_embeds" in inspect.signature(create_bidirectional_mask).parameters
+    else "input_embeds"
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATASET_DIR = BASE_DIR / "data" / "dataset"
@@ -425,7 +433,9 @@ def train_mms_ckb_head(
 
     def forward_top(h_in: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
         if create_bidirectional_mask is not None:
-            bidir_mask = create_bidirectional_mask(config=enc.config, input_embeds=h_in, attention_mask=attn_mask)
+            bidir_mask = create_bidirectional_mask(
+                config=enc.config, attention_mask=attn_mask, **{_BIDIR_EMBED_KEY: h_in}
+            )
         else:
             bidir_mask = (1.0 - attn_mask[:, None, None, :].to(h_in.dtype)) * torch.finfo(h_in.dtype).min
         h = h_in
