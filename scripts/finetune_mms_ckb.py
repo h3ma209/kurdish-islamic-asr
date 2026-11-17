@@ -10,6 +10,7 @@ authentic Arabic root letters (ض ط ص ذ أ إ اللَّه) and full Harakat 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import random
 import re
@@ -22,7 +23,13 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 import torchaudio.functional as AF
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoProcessor, Wav2Vec2ForCTC
+
+try:
+    from transformers.models.wav2vec2.modeling_wav2vec2 import create_bidirectional_mask
+except ImportError:
+    create_bidirectional_mask = None
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATASET_DIR = BASE_DIR / "data" / "dataset"
@@ -114,12 +121,129 @@ def expand_vocab_and_head(
     return vocab
 
 
-def train_mms_ckb_head(epochs: int = 8, lr: float = 5e-5, accum_steps: int = 8, start_layer: int = 24):
+def _load_wav_mono(wav_path: str) -> torch.Tensor:
+    """Load an audio file as a 1D float32 tensor."""
+    wav, _ = sf.read(wav_path)
+    if len(wav.shape) > 1:
+        wav = wav.mean(axis=1)
+    return torch.from_numpy(wav.astype("float32"))
+
+
+def _extract_hidden_states(
+    samples: list[dict],
+    processor: AutoProcessor,
+    model: Wav2Vec2ForCTC,
+    start_layer: int,
+    device: str,
+    use_amp: bool,
+    batch_size: int = 16,
+    speed_perturb: bool = False,
+    label_desc: str = "clips",
+) -> list[dict]:
+    """Extract layer-`start_layer` hidden states in sorted length-bucketed batches with AMP."""
+    enc = model.wav2vec2.encoder
+    all_layers = enc.layers
+    orig_ln = enc.layer_norm
+    # Only run layers 0..start_layer-1 without final layer_norm to match hidden_states[start_layer]
+    enc.layers = all_layers[:start_layer]
+    enc.layer_norm = nn.Identity()
+
+    items: list[tuple[np.ndarray, list[int]]] = []
+    speeds = (0.9, 1.0, 1.1) if speed_perturb else (1.0,)
+    for s in samples:
+        wav_t = _load_wav_mono(s["wav_path"])
+        wav_dev = wav_t.unsqueeze(0).to(device) if (speed_perturb and device == "cuda") else wav_t.unsqueeze(0)
+        for spd in speeds:
+            if spd == 1.0:
+                w_aug = wav_t.numpy()
+            else:
+                w_aug = AF.resample(wav_dev, int(16000 * spd), 16000).squeeze(0).cpu().numpy()
+            if int((len(w_aug) / 16000.0) * 50) <= len(s["labels"]):
+                continue
+            items.append((w_aug, s["labels"]))
+
+    # Sort by audio length to minimize padding waste in batched extraction
+    items.sort(key=lambda x: len(x[0]))
+    cached: list[dict] = []
+    amp_ctx = torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else contextlib.nullcontext()
+
+    with torch.no_grad():
+        for start in range(0, len(items), batch_size):
+            batch = items[start:start + batch_size]
+            wavs = [b[0] for b in batch]
+            inp = processor(wavs, sampling_rate=16000, return_tensors="pt", padding=True)
+            input_values = inp.input_values.to(device)
+            attention_mask = inp.attention_mask.to(device) if "attention_mask" in inp else None
+            raw_lens = (
+                attention_mask.sum(dim=1)
+                if attention_mask is not None
+                else torch.tensor([len(w) for w in wavs], device=device)
+            )
+            feat_lens = model.wav2vec2._get_feat_extract_output_lengths(raw_lens).tolist()
+
+            with amp_ctx:
+                out = model.wav2vec2(input_values, attention_mask=attention_mask, output_hidden_states=False)
+
+            hidden_batch = out.last_hidden_state.half().cpu()
+            for i, flen in enumerate(feat_lens):
+                cached.append({
+                    "hidden": hidden_batch[i, :int(flen)].contiguous(),
+                    "labels": torch.tensor(batch[i][1], dtype=torch.long),
+                })
+
+            done = min(start + batch_size, len(items))
+            if done % (batch_size * 40) == 0 or done == len(items):
+                print(f" - [{done}/{len(items)}] {label_desc} extracted...")
+
+    enc.layers = all_layers
+    enc.layer_norm = orig_ln
+    return cached
+
+
+def _apply_spec_aug(h: torch.Tensor) -> torch.Tensor:
+    """Apply SpecAugment time and channel masking to [T, C] hidden states."""
+    t_len, c_len = h.shape
+    h = h.clone()
+    if t_len > 20:
+        for _ in range(2):
+            w = random.randint(1, min(12, t_len // 10))
+            t0_m = random.randint(0, t_len - w)
+            h[t0_m:t0_m + w, :] = 0.0
+    for _ in range(2):
+        cw = random.randint(1, 64)
+        c0_m = random.randint(0, c_len - cw)
+        h[:, c0_m:c0_m + cw] = 0.0
+    return h
+
+
+def _make_length_bucketed_batches(data: list[dict], batch_size: int, shuffle: bool) -> list[list[dict]]:
+    """Group samples of similar frame lengths into batches to minimize padding."""
+    if shuffle:
+        # Jitter lengths slightly so batches vary across epochs while staying length-coherent
+        ordered = sorted(data, key=lambda x: x["hidden"].shape[0] + random.randint(-16, 16))
+    else:
+        ordered = sorted(data, key=lambda x: x["hidden"].shape[0])
+    batches = [ordered[i:i + batch_size] for i in range(0, len(ordered), batch_size)]
+    if shuffle:
+        random.shuffle(batches)
+    return batches
+
+
+def train_mms_ckb_head(
+    epochs: int = 8,
+    lr: float = 5e-5,
+    batch_size: int = 8,
+    accum_steps: int = 1,
+    start_layer: int = 24,
+    use_cache: bool = True,
+):
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Fine-Tuning Meta MMS-1B bilingual (ckb+ar) top-{48 - start_layer} adapter layers + 120-tok lm_head on {device}...")
+    use_amp = device == "cuda"
+    attn_impl = "sdpa" if device == "cuda" else "eager"
+    print(f"Fine-Tuning Meta MMS-1B bilingual (ckb+ar) top-{48 - start_layer} adapter layers + 120-tok lm_head on {device} (amp={use_amp}, attn={attn_impl}, bs={batch_size})...")
 
     processor = AutoProcessor.from_pretrained("facebook/mms-1b-all")
-    model = Wav2Vec2ForCTC.from_pretrained("facebook/mms-1b-all", attn_implementation="eager")
+    model = Wav2Vec2ForCTC.from_pretrained("facebook/mms-1b-all", attn_implementation=attn_impl)
     processor.tokenizer.set_target_lang("ckb")
     model.load_adapter("ckb")
 
@@ -174,42 +298,32 @@ def train_mms_ckb_head(epochs: int = 8, lr: float = 5e-5, accum_steps: int = 8, 
     train_samples = [samples[i] for i in indices[:split]]
     val_samples = [samples[i] for i in indices[split:]]
 
-    print(f"Pre-extracting layer-{start_layer} hidden states for {len(samples)} clips...")
-    t_ext = time.time()
-    cached_train, cached_val = [], []
+    feat_cache_path = OUTPUT_DIR / f"cached_features_L{start_layer}.pt"
+    cached_train, cached_val = None, None
+    if use_cache and feat_cache_path.exists():
+        cache_data = torch.load(feat_cache_path, map_location="cpu")
+        if cache_data.get("n_samples") == len(samples):
+            cached_train = cache_data["train"]
+            cached_val = cache_data["val"]
+            print(f"Loaded cached layer-{start_layer} features from {feat_cache_path.name} ({len(cached_train)} train, {len(cached_val)} val).")
 
-    model.wav2vec2.eval()
-    with torch.no_grad():
-        for idx, s in enumerate(train_samples):
-            wav, _ = sf.read(s["wav_path"])
-            if len(wav.shape) > 1:
-                wav = wav.mean(axis=1)
-            wav_t = torch.from_numpy(wav.astype("float32")).unsqueeze(0)
-            for spd in (0.9, 1.0, 1.1):
-                if spd == 1.0:
-                    w_aug = wav_t.squeeze(0).numpy()
-                else:
-                    # Resample to simulate speed perturbation while keeping 16kHz tensor
-                    w_aug = AF.resample(wav_t, int(16000 * spd), 16000).squeeze(0).numpy()
-                if int((len(w_aug) / 16000.0) * 50) <= len(s["labels"]):
-                    continue
-                inp = processor(w_aug, sampling_rate=16000, return_tensors="pt").to(device)
-                out = model.wav2vec2(inp.input_values, output_hidden_states=True)
-                hidden = out.hidden_states[start_layer].squeeze(0).half().cpu()
-                cached_train.append({"hidden": hidden, "labels": torch.tensor(s["labels"], dtype=torch.long)})
-            if (idx + 1) % 300 == 0 or idx == len(train_samples) - 1:
-                print(f" - [{idx + 1}/{len(train_samples)}] train clips extracted (with 3x speed perturb: {len(cached_train)} samples)...")
+    if cached_train is None:
+        print(f"Pre-extracting layer-{start_layer} hidden states for {len(samples)} clips (batch_size=16)...")
+        t_ext = time.time()
+        model.wav2vec2.eval()
+        cached_train = _extract_hidden_states(
+            train_samples, processor, model, start_layer, device, use_amp,
+            batch_size=16, speed_perturb=True, label_desc="train samples (3x speed perturb)",
+        )
+        cached_val = _extract_hidden_states(
+            val_samples, processor, model, start_layer, device, use_amp,
+            batch_size=16, speed_perturb=False, label_desc="val samples",
+        )
+        print(f"Extraction complete in {time.time() - t_ext:.2f}s!")
+        if use_cache:
+            torch.save({"n_samples": len(samples), "train": cached_train, "val": cached_val}, feat_cache_path)
 
-        for s in val_samples:
-            wav, _ = sf.read(s["wav_path"])
-            if len(wav.shape) > 1:
-                wav = wav.mean(axis=1)
-            inp = processor(wav, sampling_rate=16000, return_tensors="pt").to(device)
-            out = model.wav2vec2(inp.input_values, output_hidden_states=True)
-            hidden = out.hidden_states[start_layer].squeeze(0).half().cpu()
-            cached_val.append({"hidden": hidden, "labels": torch.tensor(s["labels"], dtype=torch.long)})
-
-    print(f"Extraction complete in {time.time() - t_ext:.2f}s! Freeing lower backbone...")
+    print("Freeing lower backbone...")
     del model.wav2vec2.feature_extractor
     del model.wav2vec2.feature_projection
     enc.layers = enc.layers[start_layer:]
@@ -221,61 +335,71 @@ def train_mms_ckb_head(epochs: int = 8, lr: float = 5e-5, accum_steps: int = 8, 
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     criterion = nn.CTCLoss(blank=vocab["<pad>"], zero_infinity=True)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    amp_ctx = torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else contextlib.nullcontext()
 
     best_val_loss = float("inf")
     saved_ckpt_path = OUTPUT_DIR / "finetuned_ckb_adapter.pt"
 
-    def apply_spec_aug(h: torch.Tensor) -> torch.Tensor:
-        # h: [1, T, C]
-        _, t_len, c_len = h.shape
-        h = h.clone()
-        if t_len > 20:
-            for _ in range(2):
-                w = random.randint(1, min(12, t_len // 10))
-                t0_m = random.randint(0, t_len - w)
-                h[:, t0_m:t0_m + w, :] = 0.0
-        for _ in range(2):
-            cw = random.randint(1, 64)
-            c0_m = random.randint(0, c_len - cw)
-            h[:, :, c0_m:c0_m + cw] = 0.0
-        return h
-
-    def forward_top(h_in: torch.Tensor) -> torch.Tensor:
+    def forward_top(h_in: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+        if create_bidirectional_mask is not None:
+            bidir_mask = create_bidirectional_mask(config=enc.config, input_embeds=h_in, attention_mask=attn_mask)
+        else:
+            bidir_mask = (1.0 - attn_mask[:, None, None, :].to(h_in.dtype)) * torch.finfo(h_in.dtype).min
         h = h_in
         for layer in enc.layers:
-            h = layer(h)[0]
+            h = layer(h, attention_mask=bidir_mask)[0]
         h = enc.layer_norm(h)
         return model.lm_head(h)
 
+    def run_batch(batch: list[dict], augment: bool) -> torch.Tensor:
+        h_list = [_apply_spec_aug(x["hidden"]) if augment else x["hidden"] for x in batch]
+        input_lens = torch.tensor([h.shape[0] for h in h_list], dtype=torch.long)
+        h_pad = pad_sequence(h_list, batch_first=True)
+        if not use_amp:
+            h_pad = h_pad.float()
+        h_pad = h_pad.to(device, non_blocking=True)
+
+        t_max = h_pad.shape[1]
+        attn_mask = (torch.arange(t_max, device=device).unsqueeze(0) < input_lens.to(device).unsqueeze(1))
+        targets = torch.cat([x["labels"] for x in batch]).to(device, non_blocking=True)
+        target_lens = torch.tensor([len(x["labels"]) for x in batch], dtype=torch.long)
+
+        with amp_ctx:
+            logits = forward_top(h_pad, attn_mask)
+        log_probs = logits.float().log_softmax(dim=-1).transpose(0, 1)
+        return criterion(log_probs, targets, input_lens, target_lens)
+
     t0 = time.time()
+    val_batches = _make_length_bucketed_batches(cached_val, batch_size=batch_size, shuffle=False)
+
     for epoch in range(1, epochs + 1):
         enc.layers.eval()
         for layer in enc.layers:
             layer.adapter_layer.train()
         model.lm_head.train()
         train_loss = 0.0
-        random.shuffle(cached_train)
-        optimizer.zero_grad()
+        train_batches = _make_length_bucketed_batches(cached_train, batch_size=batch_size, shuffle=True)
+        optimizer.zero_grad(set_to_none=True)
 
-        for step, item in enumerate(cached_train, 1):
-            hidden = apply_spec_aug(item["hidden"].unsqueeze(0).float()).to(device)
-            target = item["labels"].to(device)
-            logits = forward_top(hidden)
-            log_probs = logits.log_softmax(dim=-1).transpose(0, 1)
-            input_len = torch.tensor([hidden.shape[1]], dtype=torch.long)
-            target_len = torch.tensor([len(target)], dtype=torch.long)
-
-            loss = criterion(log_probs, target, input_len, target_len)
+        for step, batch in enumerate(train_batches, 1):
+            loss = run_batch(batch, augment=True)
             if not torch.isnan(loss) and not torch.isinf(loss):
-                (loss / accum_steps).backward()
-                train_loss += loss.item()
+                scaler.scale(loss / accum_steps).backward()
+                train_loss += loss.item() * len(batch)
 
-            if step % accum_steps == 0 or step == len(cached_train):
-                has_nan = any(p.grad is not None and torch.isnan(p.grad).any() for p in trainable_params)
-                if not has_nan:
+            if step % accum_steps == 0 or step == len(train_batches):
+                if use_amp:
+                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-                    optimizer.step()
-                optimizer.zero_grad()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    has_nan = any(p.grad is not None and torch.isnan(p.grad).any() for p in trainable_params)
+                    if not has_nan:
+                        torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                        optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
         scheduler.step()
         train_loss /= len(cached_train)
@@ -284,16 +408,10 @@ def train_mms_ckb_head(epochs: int = 8, lr: float = 5e-5, accum_steps: int = 8, 
         model.lm_head.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for item in cached_val:
-                hidden = item["hidden"].unsqueeze(0).float().to(device)
-                target = item["labels"].to(device)
-                logits = forward_top(hidden)
-                log_probs = logits.log_softmax(dim=-1).transpose(0, 1)
-                input_len = torch.tensor([hidden.shape[1]], dtype=torch.long)
-                target_len = torch.tensor([len(target)], dtype=torch.long)
-                loss = criterion(log_probs, target, input_len, target_len)
+            for batch in val_batches:
+                loss = run_batch(batch, augment=False)
                 if not torch.isnan(loss) and not torch.isinf(loss):
-                    val_loss += loss.item()
+                    val_loss += loss.item() * len(batch)
 
         val_loss /= len(cached_val)
         is_best = val_loss < best_val_loss
@@ -319,5 +437,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--accum-steps", type=int, default=1)
+    parser.add_argument("--no-cache", action="store_true")
     args = parser.parse_args()
-    train_mms_ckb_head(epochs=args.epochs, lr=args.lr)
+    train_mms_ckb_head(
+        epochs=args.epochs,
+        lr=args.lr,
+        batch_size=args.batch_size,
+        accum_steps=args.accum_steps,
+        use_cache=not args.no_cache,
+    )
