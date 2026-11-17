@@ -9,6 +9,7 @@ authentic Arabic root letters (ض ط ص ذ أ إ اللَّه) and full Harakat 
 
 from __future__ import annotations
 
+import argparse
 import json
 import random
 import re
@@ -114,7 +115,7 @@ def expand_vocab_and_head(
 
 
 def train_mms_ckb_head(epochs: int = 8, lr: float = 5e-5, accum_steps: int = 8, start_layer: int = 24):
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Fine-Tuning Meta MMS-1B bilingual (ckb+ar) top-{48 - start_layer} adapter layers + 120-tok lm_head on {device}...")
 
     processor = AutoProcessor.from_pretrained("facebook/mms-1b-all")
@@ -148,7 +149,7 @@ def train_mms_ckb_head(epochs: int = 8, lr: float = 5e-5, accum_steps: int = 8, 
     print(f"Frozen layers 0..{start_layer - 1} | Trainable adapters ({start_layer}..47) + {len(vocab)}-tok lm_head: {n_params:,} params\n")
 
     samples = []
-    for jname in ("dataset.jsonl", "quran_arabic.jsonl"):
+    for jname in ("dataset.jsonl", "quran_arabic.jsonl", "tafsir_kurdish.jsonl", "multispeaker_kurdish.jsonl"):
         jpath = DATASET_DIR / jname
         if not jpath.exists():
             continue
@@ -214,6 +215,8 @@ def train_mms_ckb_head(epochs: int = 8, lr: float = 5e-5, accum_steps: int = 8, 
     enc.layers = enc.layers[start_layer:]
     if device == "mps":
         torch.mps.empty_cache()
+    elif device == "cuda":
+        torch.cuda.empty_cache()
 
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
@@ -313,4 +316,8 @@ def train_mms_ckb_head(epochs: int = 8, lr: float = 5e-5, accum_steps: int = 8, 
 
 
 if __name__ == "__main__":
-    train_mms_ckb_head()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=6)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    args = parser.parse_args()
+    train_mms_ckb_head(epochs=args.epochs, lr=args.lr)
