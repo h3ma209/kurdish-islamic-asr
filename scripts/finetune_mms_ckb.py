@@ -129,6 +129,26 @@ def _load_wav_mono(wav_path: str) -> torch.Tensor:
     return torch.from_numpy(wav.astype("float32"))
 
 
+def _pack_batches_by_budget(items: list, len_fn, max_batch_size: int, max_budget: int) -> list[list]:
+    """Group items into batches capped by both count and padded length budget."""
+    batches: list[list] = []
+    cur: list = []
+    cur_max = 0
+    for item in items:
+        item_len = len_fn(item)
+        next_max = max(cur_max, item_len)
+        if cur and (len(cur) >= max_batch_size or next_max * (len(cur) + 1) > max_budget):
+            batches.append(cur)
+            cur = [item]
+            cur_max = item_len
+        else:
+            cur.append(item)
+            cur_max = next_max
+    if cur:
+        batches.append(cur)
+    return batches
+
+
 def _extract_hidden_states(
     samples: list[dict],
     processor: AutoProcessor,
@@ -136,11 +156,12 @@ def _extract_hidden_states(
     start_layer: int,
     device: str,
     use_amp: bool,
-    batch_size: int = 16,
+    max_batch_size: int = 16,
+    max_batch_samples: int = 16000 * 80,
     speed_perturb: bool = False,
     label_desc: str = "clips",
 ) -> list[dict]:
-    """Extract layer-`start_layer` hidden states in sorted length-bucketed batches with AMP."""
+    """Extract layer-`start_layer` hidden states in duration-budgeted batches with AMP."""
     enc = model.wav2vec2.encoder
     all_layers = enc.layers
     orig_ln = enc.layer_norm
@@ -162,14 +183,16 @@ def _extract_hidden_states(
                 continue
             items.append((w_aug, s["labels"]))
 
-    # Sort by audio length to minimize padding waste in batched extraction
-    items.sort(key=lambda x: len(x[0]))
+    # Sort longest-first so large allocations happen upfront without caching fragmentation
+    items.sort(key=lambda x: len(x[0]), reverse=True)
+    batches = _pack_batches_by_budget(items, lambda x: len(x[0]), max_batch_size, max_batch_samples)
     cached: list[dict] = []
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else contextlib.nullcontext()
+    done = 0
+    next_log = 640
 
     with torch.no_grad():
-        for start in range(0, len(items), batch_size):
-            batch = items[start:start + batch_size]
+        for batch in batches:
             wavs = [b[0] for b in batch]
             inp = processor(wavs, sampling_rate=16000, return_tensors="pt", padding=True)
             input_values = inp.input_values.to(device)
@@ -191,9 +214,10 @@ def _extract_hidden_states(
                     "labels": torch.tensor(batch[i][1], dtype=torch.long),
                 })
 
-            done = min(start + batch_size, len(items))
-            if done % (batch_size * 40) == 0 or done == len(items):
+            done += len(batch)
+            if done >= next_log or done == len(items):
                 print(f" - [{done}/{len(items)}] {label_desc} extracted...")
+                next_log += 640
 
     enc.layers = all_layers
     enc.layer_norm = orig_ln
@@ -216,14 +240,16 @@ def _apply_spec_aug(h: torch.Tensor) -> torch.Tensor:
     return h
 
 
-def _make_length_bucketed_batches(data: list[dict], batch_size: int, shuffle: bool) -> list[list[dict]]:
-    """Group samples of similar frame lengths into batches to minimize padding."""
+def _make_length_bucketed_batches(
+    data: list[dict], batch_size: int, shuffle: bool, max_batch_frames: int = 4000
+) -> list[list[dict]]:
+    """Group samples of similar frame lengths into batches capped by count and frame budget."""
     if shuffle:
         # Jitter lengths slightly so batches vary across epochs while staying length-coherent
         ordered = sorted(data, key=lambda x: x["hidden"].shape[0] + random.randint(-16, 16))
     else:
         ordered = sorted(data, key=lambda x: x["hidden"].shape[0])
-    batches = [ordered[i:i + batch_size] for i in range(0, len(ordered), batch_size)]
+    batches = _pack_batches_by_budget(ordered, lambda x: x["hidden"].shape[0], batch_size, max_batch_frames)
     if shuffle:
         random.shuffle(batches)
     return batches
@@ -308,16 +334,21 @@ def train_mms_ckb_head(
             print(f"Loaded cached layer-{start_layer} features from {feat_cache_path.name} ({len(cached_train)} train, {len(cached_val)} val).")
 
     if cached_train is None:
-        print(f"Pre-extracting layer-{start_layer} hidden states for {len(samples)} clips (batch_size=16)...")
+        print(f"Pre-extracting layer-{start_layer} hidden states for {len(samples)} clips (duration-budgeted, max bs=16)...")
         t_ext = time.time()
         model.wav2vec2.eval()
+        # Offload unused top layers to CPU during extraction to save ~1.9 GB VRAM
+        if device == "cuda":
+            for layer in enc.layers[start_layer:]:
+                layer.to("cpu")
+            torch.cuda.empty_cache()
         cached_train = _extract_hidden_states(
             train_samples, processor, model, start_layer, device, use_amp,
-            batch_size=16, speed_perturb=True, label_desc="train samples (3x speed perturb)",
+            max_batch_size=16, max_batch_samples=16000 * 80, speed_perturb=True, label_desc="train samples (3x speed perturb)",
         )
         cached_val = _extract_hidden_states(
             val_samples, processor, model, start_layer, device, use_amp,
-            batch_size=16, speed_perturb=False, label_desc="val samples",
+            max_batch_size=16, max_batch_samples=16000 * 80, speed_perturb=False, label_desc="val samples",
         )
         print(f"Extraction complete in {time.time() - t_ext:.2f}s!")
         if use_cache:
@@ -327,10 +358,12 @@ def train_mms_ckb_head(
     del model.wav2vec2.feature_extractor
     del model.wav2vec2.feature_projection
     enc.layers = enc.layers[start_layer:]
-    if device == "mps":
-        torch.mps.empty_cache()
-    elif device == "cuda":
+    if device == "cuda":
+        for layer in enc.layers:
+            layer.to(device)
         torch.cuda.empty_cache()
+    elif device == "mps":
+        torch.mps.empty_cache()
 
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
