@@ -290,15 +290,19 @@ def _make_length_bucketed_batches(
 def train_mms_ckb_head(
     epochs: int = 8,
     lr: float = 5e-5,
-    batch_size: int = 8,
+    batch_size: int = 12,
     accum_steps: int = 1,
     start_layer: int = 24,
+    speed_perturb: bool = False,
     use_cache: bool = True,
 ):
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
     use_amp = device == "cuda"
     attn_impl = "sdpa" if device == "cuda" else "eager"
-    print(f"Fine-Tuning Meta MMS-1B bilingual (ckb+ar) top-{48 - start_layer} adapter layers + 120-tok lm_head on {device} (amp={use_amp}, attn={attn_impl}, bs={batch_size})...")
+    print(
+        f"Fine-Tuning Meta MMS-1B bilingual (ckb+ar) top-{48 - start_layer} adapter layers + 120-tok lm_head "
+        f"on {device} (amp={use_amp}, attn={attn_impl}, bs={batch_size}, speed_perturb={speed_perturb})..."
+    )
 
     processor = AutoProcessor.from_pretrained("facebook/mms-1b-all")
     model = Wav2Vec2ForCTC.from_pretrained("facebook/mms-1b-all", attn_implementation=attn_impl)
@@ -362,7 +366,11 @@ def train_mms_ckb_head(
     n_train, n_val = 0, 0
     if use_cache and manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("n_samples") == len(samples) and all(Path(p).exists() for p in manifest.get("train_shards", [])):
+        if (
+            manifest.get("n_samples") == len(samples)
+            and manifest.get("speed_perturb") == speed_perturb
+            and all(Path(p).exists() for p in manifest.get("train_shards", []))
+        ):
             train_shards = manifest["train_shards"]
             val_shards = manifest["val_shards"]
             n_train = manifest["n_train"]
@@ -380,10 +388,11 @@ def train_mms_ckb_head(
             for layer in enc.layers[start_layer:]:
                 layer.to("cpu")
             torch.cuda.empty_cache()
+        train_desc = "train samples (3x speed perturb)" if speed_perturb else "train samples"
         train_shards, n_train = _extract_hidden_states(
             train_samples, processor, model, start_layer, device, use_amp,
             shard_dir=shard_dir, split_name="train",
-            max_batch_size=16, max_batch_samples=16000 * 80, speed_perturb=True, label_desc="train samples (3x speed perturb)",
+            max_batch_size=16, max_batch_samples=16000 * 80, speed_perturb=speed_perturb, label_desc=train_desc,
         )
         val_shards, n_val = _extract_hidden_states(
             val_samples, processor, model, start_layer, device, use_amp,
@@ -393,7 +402,14 @@ def train_mms_ckb_head(
         print(f"Extraction complete in {time.time() - t_ext:.2f}s!")
         if use_cache:
             manifest_path.write_text(
-                json.dumps({"n_samples": len(samples), "train_shards": train_shards, "val_shards": val_shards, "n_train": n_train, "n_val": n_val}),
+                json.dumps({
+                    "n_samples": len(samples),
+                    "speed_perturb": speed_perturb,
+                    "train_shards": train_shards,
+                    "val_shards": val_shards,
+                    "n_train": n_train,
+                    "n_val": n_val,
+                }),
                 encoding="utf-8",
             )
 
@@ -451,11 +467,13 @@ def train_mms_ckb_head(
     t0 = time.time()
 
     for epoch in range(1, epochs + 1):
+        t_ep = time.time()
         enc.eval()
         for layer in enc.layers:
             layer.adapter_layer.train()
         model.lm_head.train()
         train_loss = 0.0
+        seen_train = 0
         shard_order = list(train_shards)
         random.shuffle(shard_order)
         optimizer.zero_grad(set_to_none=True)
@@ -463,13 +481,14 @@ def train_mms_ckb_head(
         step = 0
         for s_idx, spath in enumerate(shard_order):
             shard_data = torch.load(spath, map_location="cpu")
-            train_batches = _make_length_bucketed_batches(shard_data, batch_size=batch_size, shuffle=True)
+            train_batches = _make_length_bucketed_batches(shard_data, batch_size=batch_size, shuffle=True, max_batch_frames=5000)
             for b_idx, batch in enumerate(train_batches):
                 step += 1
                 loss = run_batch(batch, augment=True)
                 if not torch.isnan(loss) and not torch.isinf(loss):
                     scaler.scale(loss / accum_steps).backward()
                     train_loss += loss.item() * len(batch)
+                seen_train += len(batch)
 
                 is_last = (s_idx == len(shard_order) - 1) and (b_idx == len(train_batches) - 1)
                 if step % accum_steps == 0 or is_last:
@@ -485,6 +504,10 @@ def train_mms_ckb_head(
                             optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
             del shard_data
+            print(
+                f"  Epoch [{epoch:02d}/{epochs:02d}] shard {s_idx + 1}/{len(shard_order)} "
+                f"| avg loss: {train_loss / max(seen_train, 1):.4f} | {time.time() - t_ep:.1f}s"
+            )
 
         scheduler.step()
         train_loss /= max(n_train, 1)
@@ -525,8 +548,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=12)
     parser.add_argument("--accum-steps", type=int, default=1)
+    parser.add_argument("--start-layer", type=int, default=24)
+    parser.add_argument("--speed-perturb", action="store_true")
     parser.add_argument("--no-cache", action="store_true")
     args = parser.parse_args()
     train_mms_ckb_head(
@@ -534,5 +559,7 @@ if __name__ == "__main__":
         lr=args.lr,
         batch_size=args.batch_size,
         accum_steps=args.accum_steps,
+        start_layer=args.start_layer,
+        speed_perturb=args.speed_perturb,
         use_cache=not args.no_cache,
     )
