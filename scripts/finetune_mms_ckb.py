@@ -256,19 +256,19 @@ def _extract_hidden_states(
     return shard_paths, total_saved
 
 
-def _apply_spec_aug(h: torch.Tensor) -> torch.Tensor:
-    """Apply SpecAugment time and channel masking to [T, C] hidden states."""
-    t_len, c_len = h.shape
-    h = h.clone()
-    if t_len > 20:
+def _apply_spec_aug_batch(h: torch.Tensor, min_len: int) -> torch.Tensor:
+    """Apply SpecAugment time and channel masking in-place on GPU/CPU [B, T, C] tensor."""
+    _, t_len, c_len = h.shape
+    if min_len > 20:
+        max_w = max(1, min(12, min_len // 10))
         for _ in range(2):
-            w = random.randint(1, min(12, t_len // 10))
+            w = random.randint(1, max_w)
             t0_m = random.randint(0, t_len - w)
-            h[t0_m:t0_m + w, :] = 0.0
+            h[:, t0_m:t0_m + w, :] = 0.0
     for _ in range(2):
         cw = random.randint(1, 64)
         c0_m = random.randint(0, c_len - cw)
-        h[:, c0_m:c0_m + cw] = 0.0
+        h[:, :, c0_m:c0_m + cw] = 0.0
     return h
 
 
@@ -447,17 +447,25 @@ def train_mms_ckb_head(
         return model.lm_head(h)
 
     def run_batch(batch: list[dict], augment: bool) -> torch.Tensor:
-        h_list = [_apply_spec_aug(x["hidden"]) if augment else x["hidden"] for x in batch]
+        h_list = [x["hidden"] for x in batch]
         input_lens = torch.tensor([h.shape[0] for h in h_list], dtype=torch.long)
         h_pad = pad_sequence(h_list, batch_first=True)
         if not use_amp:
             h_pad = h_pad.float()
-        h_pad = h_pad.to(device, non_blocking=True)
+        targets = torch.cat([x["labels"] for x in batch])
+        target_lens = torch.tensor([len(x["labels"]) for x in batch], dtype=torch.long)
+        if device == "cuda":
+            h_pad = h_pad.pin_memory().to(device, non_blocking=True)
+            targets = targets.pin_memory().to(device, non_blocking=True)
+        else:
+            h_pad = h_pad.to(device)
+            targets = targets.to(device)
+
+        if augment:
+            _apply_spec_aug_batch(h_pad, int(input_lens.min().item()))
 
         t_max = h_pad.shape[1]
         attn_mask = (torch.arange(t_max, device=device).unsqueeze(0) < input_lens.to(device).unsqueeze(1))
-        targets = torch.cat([x["labels"] for x in batch]).to(device, non_blocking=True)
-        target_lens = torch.tensor([len(x["labels"]) for x in batch], dtype=torch.long)
 
         with amp_ctx:
             logits = forward_top(h_pad, attn_mask)
@@ -465,6 +473,8 @@ def train_mms_ckb_head(
         return criterion(log_probs, targets, input_lens, target_lens)
 
     t0 = time.time()
+    drive_backup_dir = Path("/content/drive/MyDrive/kurdish_asr_output")
+    has_drive = Path("/content/drive/MyDrive").exists()
 
     for epoch in range(1, epochs + 1):
         t_ep = time.time()
@@ -481,7 +491,7 @@ def train_mms_ckb_head(
         step = 0
         for s_idx, spath in enumerate(shard_order):
             shard_data = torch.load(spath, map_location="cpu")
-            train_batches = _make_length_bucketed_batches(shard_data, batch_size=batch_size, shuffle=True, max_batch_frames=5000)
+            train_batches = _make_length_bucketed_batches(shard_data, batch_size=batch_size, shuffle=True, max_batch_frames=9000)
             for b_idx, batch in enumerate(train_batches):
                 step += 1
                 loss = run_batch(batch, augment=True)
@@ -537,6 +547,10 @@ def train_mms_ckb_head(
                 },
                 saved_ckpt_path,
             )
+            if has_drive:
+                drive_backup_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(saved_ckpt_path, drive_backup_dir / saved_ckpt_path.name)
+                shutil.copy2(OUTPUT_DIR / "vocab.json", drive_backup_dir / "vocab.json")
 
         print(f"Epoch [{epoch:02d}/{epochs:02d}] | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} {'[BEST]' if is_best else ''}")
 
@@ -546,9 +560,9 @@ def train_mms_ckb_head(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=6)
+    parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--batch-size", type=int, default=12)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--accum-steps", type=int, default=1)
     parser.add_argument("--start-layer", type=int, default=24)
     parser.add_argument("--speed-perturb", action="store_true")
